@@ -4,6 +4,8 @@ from tqdm import tqdm
 from datetime import date, datetime
 import csv
 import sys
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
 
 
 def get_user_input():
@@ -44,7 +46,28 @@ def get_user_input():
                 break
             else:
                 print("Invalid input. Please enter 0, 1, 2, or 3.")
-    return is_redraft, league_format, tep
+
+    # Prompt for S3 upload - simplified to just yes/no
+    while True:
+        s3_upload_input = input(
+            "Do you want to upload the CSV to S3? (yes/no): ").strip().lower()
+        if s3_upload_input in ['yes', 'y', '1', 'true', 't']:
+            s3_upload = True
+            break
+        elif s3_upload_input in ['no', 'n', '0', 'false', 'f']:
+            s3_upload = False
+            break
+        else:
+            print("Invalid input. Please enter 'yes' or 'no'.")
+
+    # Hardcoded S3 bucket and key
+    # REPLACE THIS with your actual bucket name
+    # "fantasy-football-data-bucket"
+    # not a real bucket. not needed for testing.
+    s3_bucket = 'fake-fantasy-football-data-bucket'
+    s3_key = "ktc.csv"
+
+    return is_redraft, league_format, tep, s3_upload, s3_bucket, s3_key
 
 
 def fetch_ktc_page(url):
@@ -79,10 +102,25 @@ def scrape_players(base_url, format_code, is_dynasty, value_key, pos_rank_key, m
 
     players = []
     for player_element in all_elements:
+        # player_name_element = 'Josh AllenBUF' after calling .get_text(strip=True)
         player_name_element = player_element.find(class_="player-name")
-        player_position_element = player_element.find(class_="position")
-        player_value_element = player_element.find(class_="value")
-        player_age_element = player_element.find(class_="position hidden-xs")
+        player_position_element = player_element.find(
+            class_="position")  # is actually position rank: QB1
+        player_value_element = player_element.find(class_="value")  # 9997
+        player_age_element = player_element.find(
+            class_="position hidden-xs")  # <p class="position hidden-xs">29.0 y.o.</p>
+        # player_rank_number = player_element.find(
+        #     class_="rank-number").get_text(strip=True)  # '1'
+        # player_30_day_trend = player_element.find(
+        #     class_="trend").get_text(strip=True)  # 0
+        # player_tier = player_element.find(
+        #     class_="player-info").contents[1].get_text(strip=True)  # 'Tier 1'
+        # player_age = player_element.find(
+        #     class_="position-team").contents[4].get_text(strip=True)  # '29.0 y.o.'
+        # player_name = player_element.find(
+        #     class_="player-name").contents[1].contents[1].get_text(strip=True)  # 'Josh Allen'
+        # player_team = player_element.find(
+        #     class_="player-team").get_text()  # 'BUF'
 
         if not (player_name_element and player_position_element and player_value_element):
             continue
@@ -258,7 +296,37 @@ def make_unique(rows_data, value_col_names):
     return rows_data
 
 
-def export_to_csv(players, league_format, tep, is_redraft):
+def upload_to_s3(file_path, bucket_name, object_key):
+    """
+    Upload a file to an S3 bucket
+
+    Parameters:
+    file_path (str): The path to the file to upload
+    bucket_name (str): The name of the S3 bucket
+    object_key (str): The S3 object key (path/filename.csv)
+
+    Returns:
+    bool: True if upload was successful, False otherwise
+    """
+    try:
+        s3_client = boto3.client('s3')
+        print(f"Uploading {file_path} to s3://{bucket_name}/{object_key}...")
+        s3_client.upload_file(file_path, bucket_name, object_key)
+        print(
+            f"Successfully uploaded {file_path} to s3://{bucket_name}/{object_key}")
+        return True
+    except NoCredentialsError:
+        print("Error: AWS credentials not found. Make sure you've configured your AWS credentials.")
+        return False
+    except ClientError as e:
+        print(f"Error uploading to S3: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error uploading to S3: {e}")
+        return False
+
+
+def export_to_csv(players, league_format, tep, is_redraft, s3_upload=False, s3_bucket=None, s3_key=None):
     timestamp = f"Updated {date.today().strftime('%m/%d/%y')} at {datetime.now().strftime('%I:%M%p').lower()}"
     if is_redraft:
         if league_format == '1QB':
@@ -309,8 +377,13 @@ def export_to_csv(players, league_format, tep, is_redraft):
     print(
         f"Data exported to {csv_filename} on {date.today().strftime('%B %d, %Y')} successful.")
 
+    # Upload to S3 if requested
+    if s3_upload and s3_bucket and s3_key:
+        upload_to_s3(csv_filename, s3_bucket, s3_key)
+
 
 if __name__ == "__main__":
-    is_redraft, league_format, tep = get_user_input()
+    is_redraft, league_format, tep, s3_upload, s3_bucket, s3_key = get_user_input()
     players = scrape_ktc(is_redraft, league_format)
-    export_to_csv(players, league_format, tep, is_redraft)
+    export_to_csv(players, league_format, tep, is_redraft,
+                  s3_upload, s3_bucket, s3_key)
