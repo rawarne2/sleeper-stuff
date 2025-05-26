@@ -1,4 +1,5 @@
 import requests
+import os
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from datetime import date, datetime
@@ -60,11 +61,7 @@ def get_user_input():
         else:
             print("Invalid input. Please enter 'yes' or 'no'.")
 
-    # Hardcoded S3 bucket and key
-    # REPLACE THIS with your actual bucket name
-    # "fantasy-football-data-bucket"
-    # not a real bucket. not needed for testing.
-    s3_bucket = 'fake-fantasy-football-data-bucket'
+    s3_bucket = os.getenv('S3_BUCKET')
     s3_key = "ktc.csv"
 
     return is_redraft, league_format, tep, s3_upload, s3_bucket, s3_key
@@ -80,7 +77,7 @@ def fetch_ktc_page(url):
         sys.exit(1)
 
 
-def scrape_players(base_url, format_code, is_dynasty, value_key, pos_rank_key, max_pages=10):
+def scrape_players(base_url, format_code, value_key, pos_rank_key, max_pages=10):
     all_elements = []
     # Set progress bar description based on URL and format
     if 'dynasty' in base_url:
@@ -102,25 +99,50 @@ def scrape_players(base_url, format_code, is_dynasty, value_key, pos_rank_key, m
 
     players = []
     for player_element in all_elements:
-        # player_name_element = 'Josh AllenBUF' after calling .get_text(strip=True)
         player_name_element = player_element.find(class_="player-name")
-        player_position_element = player_element.find(
-            class_="position")  # is actually position rank: QB1
-        player_value_element = player_element.find(class_="value")  # 9997
-        player_age_element = player_element.find(
-            class_="position hidden-xs")  # <p class="position hidden-xs">29.0 y.o.</p>
-        # player_rank_number = player_element.find(
-        #     class_="rank-number").get_text(strip=True)  # '1'
-        # player_30_day_trend = player_element.find(
-        #     class_="trend").get_text(strip=True)  # 0
-        # player_tier = player_element.find(
-        #     class_="player-info").contents[1].get_text(strip=True)  # 'Tier 1'
-        # player_age = player_element.find(
-        #     class_="position-team").contents[4].get_text(strip=True)  # '29.0 y.o.'
-        # player_name = player_element.find(
-        #     class_="player-name").contents[1].contents[1].get_text(strip=True)  # 'Josh Allen'
-        # player_team = player_element.find(
-        #     class_="player-team").get_text()  # 'BUF'
+        player_position_element = player_element.find(class_="position")
+        player_value_element = player_element.find(class_="value")
+        player_age_element = player_element.find(class_="position hidden-xs")
+
+        # Extract rank number
+        rank_element = player_element.find(class_="rank-number")
+        try:
+            player_rank = int(rank_element.get_text(
+                strip=True)) if rank_element else None
+        except (ValueError, AttributeError):
+            player_rank = None
+
+        # Extract trend with direction
+        trend_element = player_element.find(class_="trend")
+        player_trend = None
+        if trend_element:
+            trend_value = trend_element.get_text(strip=True)
+            if trend_element.contents and len(trend_element.contents) > 1:
+                try:
+                    trend_class = trend_element.contents[1].attrs.get("class", [""])[
+                        0]
+                    if trend_class == "trend-up":
+                        player_trend = f"+{trend_value}" if trend_value else "+0"
+                    elif trend_class == "trend-down":
+                        player_trend = f"-{trend_value}" if trend_value else "-0"
+                    else:
+                        player_trend = "0"
+                except (IndexError, AttributeError):
+                    player_trend = "0"
+            else:
+                player_trend = "0"
+        else:
+            player_trend = "0"
+
+        # Extract tier
+        player_tier = None
+        player_info_element = player_element.find(class_="player-info")
+        if player_info_element and len(player_info_element.contents) > 1:
+            try:
+                player_tier = player_info_element.contents[1].get_text(
+                    strip=True)
+            except (IndexError, AttributeError):
+                player_tier = None
 
         if not (player_name_element and player_position_element and player_value_element):
             continue
@@ -139,31 +161,37 @@ def scrape_players(base_url, format_code, is_dynasty, value_key, pos_rank_key, m
             player_value = int(player_value_element.get_text(strip=True))
         except Exception:
             player_value = 0
+
+        # Always extract age regardless of league type
         player_age = None
-        if is_dynasty and player_age_element:
+        if player_age_element:
             player_age_text = player_age_element.get_text(strip=True)
             try:
                 player_age = float(
                     player_age_text[:4]) if player_age_text else None
             except Exception:
                 player_age = None
-        else:
-            player_age = None
+
+        # Always determine rookie status
         if team_suffix and team_suffix[0] == 'R':
             player_team = team_suffix[1:]
             player_rookie = "Yes"
         else:
             player_team = team_suffix
             player_rookie = "No"
-        if player_position == "PI":
+
+        if player_position == "PI":  # Player Inactive
             player_info = {
                 "Player Name": player_name,
                 pos_rank_key: None,
                 "Position": player_position,
                 "Team": None,
                 value_key: player_value,
-                "Age": player_age if is_dynasty else None,
-                "Rookie": player_rookie if is_dynasty else None
+                "Age": player_age,
+                "Rookie": player_rookie,
+                "Rank": player_rank,
+                "Trend": player_trend,
+                "Tier": player_tier
             }
         else:
             player_info = {
@@ -172,8 +200,11 @@ def scrape_players(base_url, format_code, is_dynasty, value_key, pos_rank_key, m
                 "Position": player_position,
                 "Team": player_team,
                 value_key: player_value,
-                "Age": player_age if is_dynasty else None,
-                "Rookie": player_rookie if is_dynasty else None
+                "Age": player_age,
+                "Rookie": player_rookie,
+                "Rank": player_rank,
+                "Trend": player_trend,
+                "Tier": player_tier
             }
         players.append(player_info)
     return players
@@ -191,8 +222,50 @@ def merge_redraft_values(players, base_url, format_code, value_key, pos_rank_key
         player_name_element = player_element.find(class_="player-name")
         player_position_element = player_element.find(class_="position")
         player_value_element = player_element.find(class_="value")
+
+        # Extract rank number
+        rank_element = player_element.find(class_="rank-number")
+        try:
+            redraft_rank = int(rank_element.get_text(
+                strip=True)) if rank_element else None
+        except (ValueError, AttributeError):
+            redraft_rank = None
+
+        # Extract trend with direction
+        trend_element = player_element.find(class_="trend")
+        redraft_trend = None
+        if trend_element:
+            trend_value = trend_element.get_text(strip=True)
+            if trend_element.contents and len(trend_element.contents) > 1:
+                try:
+                    trend_class = trend_element.contents[1].attrs.get("class", [""])[
+                        0]
+                    if trend_class == "trend-up":
+                        redraft_trend = f"+{trend_value}" if trend_value else "+0"
+                    elif trend_class == "trend-down":
+                        redraft_trend = f"-{trend_value}" if trend_value else "-0"
+                    else:
+                        redraft_trend = "0"
+                except (IndexError, AttributeError):
+                    redraft_trend = "0"
+            else:
+                redraft_trend = "0"
+        else:
+            redraft_trend = "0"
+
+        # Extract tier
+        redraft_tier = None
+        player_info_element = player_element.find(class_="player-info")
+        if player_info_element and len(player_info_element.contents) > 1:
+            try:
+                redraft_tier = player_info_element.contents[1].get_text(
+                    strip=True)
+            except (IndexError, AttributeError):
+                redraft_tier = None
+
         if not (player_name_element and player_position_element and player_value_element):
             continue
+
         player_name = player_name_element.get_text(strip=True)
         team_suffix = (
             player_name[-3:] if player_name[-3:] == 'RFA' else
@@ -210,6 +283,9 @@ def merge_redraft_values(players, base_url, format_code, value_key, pos_rank_key
             if player["Player Name"] == player_name:
                 player[pos_rank_key] = player_position_rank
                 player[value_key] = player_value
+                player["RdrftRank"] = redraft_rank
+                player["RdrftTrend"] = redraft_trend
+                player["RdrftTier"] = redraft_tier
                 break
     return players
 
@@ -222,7 +298,7 @@ def scrape_ktc(is_redraft, league_format):
         pos_rank_key = 'Position Rank'
         base_url = "https://keeptradecut.com/dynasty-rankings?page={0}&filters=QB|WR|RB|TE|RDP&format={1}"
         players = scrape_players(
-            base_url, format_code, True, value_key, pos_rank_key)
+            base_url, format_code, value_key, pos_rank_key)
         if is_redraft:
             redraft_url = "https://keeptradecut.com/fantasy-rankings?page={0}&filters=QB|WR|RB|TE&format={1}"
             players = merge_redraft_values(
@@ -233,7 +309,7 @@ def scrape_ktc(is_redraft, league_format):
         pos_rank_key = 'SFPosition Rank'
         base_url = "https://keeptradecut.com/dynasty-rankings?page={0}&filters=QB|WR|RB|TE|RDP&format={1}"
         players = scrape_players(
-            base_url, format_code, True, value_key, pos_rank_key)
+            base_url, format_code, value_key, pos_rank_key)
         if is_redraft:
             redraft_url = "https://keeptradecut.com/fantasy-rankings?page={0}&filters=QB|WR|RB|TE&format={1}"
             players = merge_redraft_values(
@@ -281,21 +357,6 @@ def tep_adjust(rows_data, tep, value_col_names):
     return rows_data
 
 
-def make_unique(rows_data, value_col_names):
-    header = rows_data[0]
-    col_indices = [header.index(col)
-                   for col in value_col_names if col in header]
-    for idx in col_indices:
-        seen_values = set()
-        for player in rows_data[1:]:
-            current_value = player[idx]
-            while current_value in seen_values:
-                current_value -= 0.01
-            seen_values.add(current_value)
-            player[idx] = current_value
-    return rows_data
-
-
 def upload_to_s3(file_path, bucket_name, object_key):
     """
     Upload a file to an S3 bucket
@@ -330,46 +391,66 @@ def export_to_csv(players, league_format, tep, is_redraft, s3_upload=False, s3_b
     timestamp = f"Updated {date.today().strftime('%m/%d/%y')} at {datetime.now().strftime('%I:%M%p').lower()}"
     if is_redraft:
         if league_format == '1QB':
-            header = [timestamp, "Position Rank",
-                      "Position", "Team", "RdrftValue"]
+            header = [timestamp, "Rank", "Trend", "Tier",
+                      "Position Rank", "Position", "Team", "RdrftValue", "Age", "Rookie"]
             value_cols = ["RdrftValue"]
             rows_data = [
-                [player["Player Name"], player.get(
-                    "RdrftPosition Rank"), player["Position"], player["Team"], player.get("RdrftValue", 0)]
+                [player["Player Name"], player.get("RdrftRank"), player.get("RdrftTrend", "0"), player.get("RdrftTier"),
+                 player.get(
+                     "RdrftPosition Rank"), player["Position"], player["Team"],
+                 player.get("RdrftValue", 0), player.get("Age"), player.get("Rookie")]
                 for player in players if player.get("RdrftValue", 0) > 0
             ]
         else:
-            header = [timestamp, "SFPosition Rank",
-                      "Position", "Team", "SFRdrftValue"]
+            header = [timestamp, "Rank", "Trend", "Tier",
+                      "Position Rank", "Position", "Team", "SFRdrftValue", "Age", "Rookie"]
             value_cols = ["SFRdrftValue"]
             rows_data = [
-                [player["Player Name"], player.get(
-                    "SFRdrftPosition Rank"), player["Position"], player["Team"], player.get("SFRdrftValue", 0)]
+                [player["Player Name"], player.get("RdrftRank"), player.get("RdrftTrend", "0"), player.get("RdrftTier"),
+                 player.get(
+                     "SFRdrftPosition Rank"), player["Position"], player["Team"],
+                 player.get("SFRdrftValue", 0), player.get("Age"), player.get("Rookie")]
                 for player in players if player.get("SFRdrftValue", 0) > 0
             ]
     else:
         if league_format == '1QB':
-            header = [timestamp, "Position Rank",
-                      "Position", "Team", "Value", "Age", "Rookie"]
+            header = [timestamp, "Rank", "Trend", "Tier",
+                      "Position Rank", "Position", "Team", "Value", "Age", "Rookie"]
             value_cols = ["Value"]
             rows_data = [
-                [player["Player Name"], player.get("Position Rank"), player["Position"], player["Team"], player.get(
-                    "Value", 0), player.get("Age"), player.get("Rookie")]
+                [player["Player Name"], player.get("Rank"), player.get("Trend", "0"), player.get("Tier"),
+                 player.get(
+                     "Position Rank"), player["Position"], player["Team"],
+                 player.get("Value", 0), player.get("Age"), player.get("Rookie")]
                 for player in players if player.get("Value", 0) > 0
             ]
         else:
-            header = [timestamp, "SFPosition Rank",
-                      "Position", "Team", "SFValue", "Age", "Rookie"]
+            header = [timestamp, "Rank", "Trend", "Tier",
+                      "Position Rank", "Position", "Team", "SFValue", "Age", "Rookie"]
             value_cols = ["SFValue"]
             rows_data = [
-                [player["Player Name"], player.get("SFPosition Rank"), player["Position"], player["Team"], player.get(
-                    "SFValue", 0), player.get("Age"), player.get("Rookie")]
+                [player["Player Name"], player.get("Rank"), player.get("Trend", "0"), player.get("Tier"),
+                 player.get(
+                     "SFPosition Rank"), player["Position"], player["Team"],
+                 player.get("SFValue", 0), player.get("Age"), player.get("Rookie")]
                 for player in players if player.get("SFValue", 0) > 0
             ]
     rows_data.insert(0, header)
     if not is_redraft and tep > 0:
         rows_data = tep_adjust(rows_data, tep, value_cols)
-    rows_data = make_unique(rows_data, value_cols)
+
+    # Remove call to make_unique and instead sort by value and then by rank
+    # If two players have the same value, the one with better rank (lower number) will come first
+    value_col = value_cols[0]
+    value_idx = header.index(value_col)
+    rank_idx = header.index("Rank")
+
+    # Sort first by value (descending), then by rank (ascending) when values are equal
+    rows_data = [header] + sorted(rows_data[1:],
+                                  key=lambda x: (
+                                      x[value_idx], -float(x[rank_idx]) if x[rank_idx] is not None else float('inf')),
+                                  reverse=True)
+
     csv_filename = 'ktc.csv'
     with open(csv_filename, 'w', newline='') as csv_file:
         csv_writer = csv.writer(csv_file)
